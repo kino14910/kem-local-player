@@ -6,7 +6,7 @@
 	"type": "module",
 	"packageManager": "pnpm@12.21.0+sha512.66fd8278ee28935ce951792d34367ff3af5c432a2756445823029533835b8da529bbe0be5130afd56ed0713fb8789e47bad82d93bd5ae2fe54b15562d6276ef0",
 	"files": [
-		"dist/client.js",
+		"dist/",
 		"host.mjs"
 	],
 	"kem": {
@@ -15,17 +15,18 @@
 		"title": "本地播放器",
 		"description": "本地音频播放器与桌面歌词",
 		"client": {
-			"entry": "./dist/client.js",
+			"root": "./dist",
+			"entry": "./client.js",
 			"label": "本地播放器"
 		},
 		"host": "./host.mjs"
 	},
 	"scripts": {
 		"dev": "vite build --watch",
-		"build": "vite build && node scripts/package-client.mjs",
-		"prepack": "vite build && node scripts/package-client.mjs",
+		"build": "vite build",
+		"prepack": "pnpm run build",
 		"check": "svelte-check --tsconfig ./tsconfig.json",
-		"test": "vite build && node scripts/package-client.mjs && node --test tests/*.test.mjs"
+		"test": "pnpm run build && node --conditions=browser --test tests/*.test.mjs"
 	},
 	"devDependencies": {
 		"@sveltejs/vite-plugin-svelte": "^7.3.1",

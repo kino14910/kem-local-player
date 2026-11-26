@@ -18,7 +18,7 @@ pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-`pnpm dev` 以 watch 模式重建 `build/client.js`。用 `pnpm pack` 打出 `.tgz`，然后在 KEM 里用「插件 → 导入本地插件」导入。
+`pnpm dev` 以 watch 模式重建 `dist/client.js` 和 `dist/chunks/`。用 `pnpm pack`（或 `npm pack`）打出 `.tgz`，然后在支持原生 ESM 插件的 KEM 中用「插件 → 导入本地插件」导入。
 
 | 要修改的内容 | 文件 |
 | --- | --- |
@@ -31,14 +31,25 @@ pnpm dev
 
 ## 构建契约
 
-`pnpm run build` 用 Vite 产出单文件 IIFE，再由 `scripts/package-client.mjs` 校验并复制到 `dist/client.js`。
+`pnpm run build` 直接用 Vite 生成原生 ESM。`package.json` 声明：
 
-- 产物形如 `var __KEM_CLIENT_PLUGIN__ = (function (…) {…})(…)`，导出 Cordis 插件。
-- `svelte`、`svelte/internal/client`、`svelte/store`、`svelte/reactivity`、`svelte/internal/disclose-version` 必须保持 external，由宿主通过 `KEM_PLATFORM` 注入唯一副本。混入第二份 Svelte 会让响应式失效。
-- 组件样式内联进 bundle（`css: 'injected'`），`dist/` 只允许 `client.js`。
-- 大小上限 4 MiB，超限或 `dist/` 出现其他文件时构建失败。
+```json
+{
+  "client": {
+    "root": "./dist",
+    "entry": "./client.js",
+    "label": "本地播放器"
+  },
+  "host": "./host.mjs"
+}
+```
 
-## 与最新 KEM 运行时配合
+- `kem.client.root` 相对于 npm 包根目录；`kem.client.entry` 相对于该发布根目录，不包含 `dist/` 前缀。`host.mjs` 相对于包根目录，留在客户端发布根目录之外。
+- `dist/client.js` 默认导出 Cordis 插件，并通过相对路径静态导入 `./chunks/player-state-<hash>.js`。导航页、底栏与桌面控制共享该 chunk 中的同一个播放器 store。导入或分发时保留整个 `dist/` 目录结构。
+- KEM 提供共享的 Svelte 客户端运行时。本产物实际使用的裸导入是 `svelte`、`svelte/internal/client`、`svelte/internal/disclose-version` 和 `svelte/store`。`svelte/reactivity` 也是宿主支持的入口，但目前没有用到。没有额外的裸导入或插件依赖，因此省略 `requires`。
+- 组件样式仍由 Svelte 注入（`css: 'injected'`）。`dist/` 只包含客户端 JS 模块；构建会检查入口、分块和外部依赖，并将全部客户端模块限制在 4 MiB 以内。
+
+## 与 KEM 运行时配合
 
 - 导航页与底栏都接收 KEM 传入的 `snapshot`（含 `bootId`、`revision`）。`bootId` 变化表示 Host 已重启，插件会暂停播放、回收旧 `blob:` URL 并清空曲库，保留音量。
 - KEM 通过 revision/SSE 把其他窗口的启停同步到当前窗口。停用、升级或卸载会释放 Fiber，音频、ObjectURL、托盘菜单和浮窗随 `ctx.effect` 一起回收。
@@ -53,7 +64,7 @@ pnpm test        # 构建 + 校验 bundle 契约
 pnpm run build   # 只构建
 ```
 
-`pnpm test` 会在仓库内构建，检查产物没有残留 ESM 语法、没有旁路 CSS 资产，然后把 bundle 放进真实 Svelte 运行时与伪 `window` 中求值，确认导出 `{ inject: ['navRail', 'surfaces'], apply }`；同时验证 Host `bootId` 变化时旧曲目与 ObjectURL 会被回收。
+`pnpm test` 会先构建，再检查入口与分块的 ESM 导入图、相对路径和共享裸导入。测试使用 Node 的 `--conditions=browser` 选中真实 Svelte 客户端运行时，原生导入入口并验证 Cordis 默认导出、导航/底栏注册与桌面资源清理；同时验证 Host `bootId` 变化时旧曲目与 ObjectURL 会被回收。
 
 在 KEM 里的人工验收：
 
@@ -67,7 +78,7 @@ pnpm run build   # 只构建
 ## 创建和发布插件
 
 1. 在 `package.json` 中设置 npm 包名、版本、作者和描述。将 `kem.id` 换成自己的唯一标识，以小写字母开头，可含小写字母、数字和连字符，最长 64 个字符。更新 `kem.title`、`kem.description` 和 `kem.client.label`。
-2. 运行 `pnpm pack`。它会重新构建，并把 `dist/client.js` 和 `host.mjs` 连同包清单、README 打进 `.tgz`。安装端可直接加载成品。
+2. 运行 `pnpm pack` 或 `npm pack`。`prepack` 会重新构建；`.tgz` 包含整个 `dist/`（入口及分块）、独立的 `host.mjs`、`package.json` 和 README。不包含源码、测试或旧版播放器。可用 `tar -tf kem-local-player-<version>.tgz` 检查包内路径。
 3. 准备发布时，移除 `private: true`，将包发布到目标 npm registry，再将对应包名和版本加入 KEM 市场索引。
 
-`kem.client.entry` 必须指向包内以 `./` 开头、以 `.js` 或 `.mjs` 结尾的文件。KEM 按包内 `package.json` 的 `kem` 声明核对插件 ID、版本与 API 版本，读取上限 4 MiB 的 UTF-8 源码后在 Renderer 中求值。
+`kem.client.entry` 使用相对于 `kem.client.root` 的 `./` 路径。KEM 从该客户端发布根目录加载 ESM 模块图，而不是读取单文件并求值。

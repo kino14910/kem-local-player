@@ -1,66 +1,87 @@
 import assert from 'node:assert/strict';
-import { before, test } from 'node:test';
-import { execFile } from 'node:child_process';
+import { test } from 'node:test';
 import { readdir, readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { promisify } from 'node:util';
+import { parseSync } from 'vite';
 
-const run = promisify(execFile);
-const project = dirname(dirname(fileURLToPath(import.meta.url)));
+const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+const sharedModules = new Set([
+  'svelte',
+  'svelte/internal/client',
+  'svelte/internal/disclose-version',
+  'svelte/store',
+  'svelte/reactivity',
+]);
+const root = new URL(`../${manifest.kem.client.root}/`, import.meta.url);
+const entry = new URL(manifest.kem.client.entry, root);
 
-let code;
-let runtime;
-
-/** The same single Svelte runtime the KEM renderer hands to plugin bundles. */
-async function loadPlatform() {
-  const load = (path) => import(pathToFileURL(join(project, 'node_modules', path)).href);
-  const [svelte, svelteInternalClient, svelteStore, svelteReactivity, discloseVersion] =
-    await Promise.all([
-      load('svelte/src/index-client.js'),
-      load('svelte/src/internal/client/index.js'),
-      load('svelte/src/store/index-client.js'),
-      load('svelte/src/reactivity/index-client.js'),
-      load('svelte/src/internal/disclose-version.js'),
-    ]);
-  return { svelte, svelteInternalClient, svelteStore, svelteReactivity, discloseVersion };
+async function listClientFiles(dir) {
+  const files = [];
+  for (const child of await readdir(dir, { withFileTypes: true })) {
+    if (child.isDirectory()) {
+      files.push(...await listClientFiles(new URL(child.name + '/', dir)));
+    } else {
+      assert.ok(child.isFile() && child.name.endsWith('.js'), `Unexpected client file: ${child.name}`);
+      files.push(new URL(child.name, dir).href);
+    }
+  }
+  return files;
 }
 
-function evaluate(windowStub) {
-  const bundle = new Function(
-    'KEM_PLATFORM',
-    'window',
-    `${code}\nreturn __KEM_CLIENT_PLUGIN__?.default ?? __KEM_CLIENT_PLUGIN__;`,
-  );
-  return bundle(runtime, windowStub);
-}
+test('ships a native ESM entry and a reachable chunk under the client publish root', async () => {
+  assert.equal(manifest.kem.client.root, './dist');
+  assert.equal(manifest.kem.client.entry, './client.js');
+  assert.equal(manifest.kem.host, './host.mjs');
+  assert.deepEqual(manifest.files, ['dist/', 'host.mjs']);
 
-before(async () => {
-  await run(
-    process.execPath,
-    [
-      join(project, 'node_modules/vite/bin/vite.js'),
-      'build',
-      project,
-      '--config',
-      join(project, 'vite.config.ts'),
-    ],
-    { cwd: project },
-  );
-  code = await readFile(join(project, 'build/client.js'), 'utf8');
-  runtime = await loadPlatform();
-});
+  const files = new Set(await listClientFiles(root));
+  const visited = new Set();
+  const bare = new Set();
+  async function visit(url) {
+    if (visited.has(url.href)) return;
+    assert.ok(files.has(url.href), `Module is missing from the client publish root: ${url.href}`);
+    visited.add(url.href);
+    const code = await readFile(url, 'utf8');
+    const { module, errors } = parseSync(url.pathname, code);
+    assert.deepEqual(errors, []);
+    assert.equal(module.hasModuleSyntax, true);
+    assert.doesNotMatch(code, /__KEM_CLIENT_PLUGIN__|\bKEM_PLATFORM\b/);
+    const refs = [
+      ...module.staticImports.map(({ moduleRequest }) => moduleRequest.value),
+      ...module.staticExports.flatMap(({ entries }) =>
+        entries.flatMap(({ moduleRequest }) => moduleRequest ? [moduleRequest.value] : [])),
+      ...module.dynamicImports.map(({ moduleRequest: { start, end } }) => {
+        const { program } = parseSync(url.pathname, code.slice(start, end));
+        const [statement] = program.body;
+        assert.ok(statement?.type === 'ExpressionStatement' &&
+          statement.expression.type === 'Literal' && typeof statement.expression.value === 'string',
+        'Expected a literal dynamic import');
+        return statement.expression.value;
+      }),
+    ];
+    for (const id of refs) {
+      if (id.startsWith('./') || id.startsWith('../')) {
+        await visit(new URL(id, url));
+      } else {
+        assert.ok(sharedModules.has(id), `Unsupported client import: ${id}`);
+        bare.add(id);
+      }
+    }
+  }
 
-test('builds one client bundle that exports a nav and footer plugin', async () => {
-  assert.ok(!/^\s*(?:import|export)\s/m.test(code), 'client bundle must not keep ESM syntax');
-  // Styles are compiled into the bundle instead of a sibling .css asset.
-  assert.deepEqual(await readdir(join(project, 'build')), ['client.js']);
-  const plugin = evaluate({ kemDesktop: { contributions: {} } });
+  await visit(entry);
+  assert.ok(visited.size > 1, 'Expected the entry to load a separate JS chunk');
+  assert.deepEqual(visited, files, 'Every emitted JS file must be reachable from the entry');
+  for (const id of ['svelte', 'svelte/internal/client', 'svelte/internal/disclose-version', 'svelte/store']) {
+    assert.ok(bare.has(id), `Expected shared external: ${id}`);
+  }
+
+  // --conditions=browser selects the same Svelte client exports as the renderer.
+  const { default: plugin } = await import(entry.href);
   assert.deepEqual(plugin.inject, ['navRail', 'surfaces']);
   assert.equal(typeof plugin.apply, 'function');
 });
 
-test('registers the nav page, footer and desktop scope on one plugin fiber', async () => {
+test('registers the nav page, footer and desktop scope on one plugin fiber', async (t) => {
   const events = [];
   let listener;
   let nav;
@@ -101,7 +122,13 @@ test('registers the nav page, footer and desktop scope on one plugin fiber', asy
     },
   };
 
-  const plugin = evaluate(windowStub);
+  const originalWindow = globalThis.window;
+  globalThis.window = windowStub;
+  t.after(() => {
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  });
+  const { default: plugin } = await import(entry.href);
   await plugin.apply(ctx);
 
   assert.equal(nav.id, 'local-player');
@@ -123,4 +150,5 @@ test('registers the nav page, footer and desktop scope on one plugin fiber', asy
 
   for (const cleanup of effects) await cleanup();
   assert.ok(events.some(([type, key]) => type === 'close' && key === scope));
+  assert.ok(events.some(([type]) => type === 'unsubscribe'));
 });
